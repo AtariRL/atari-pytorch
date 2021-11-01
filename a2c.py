@@ -182,6 +182,7 @@ class Worker(object):
                 self.episode_reward = 0
             else:
                 self.state = FloatTensor(next_state)
+                logger.logkv("Episode Reward", self.episode_reward)
                 
         values = compute_true_values(states, rewards, dones).unsqueeze(1)
         return states, actions, values
