@@ -217,6 +217,6 @@ while frame_idx < max_frames:
    # if frame_idx % 1000 == 0:
      #   print(value)
     # Log every episode 
-    logger.logkv("episode_rewards", data['episode_rewards'])
-    logger.logkv("values", data['values'])
+    logger.logkv("frame", frame_idx)
+    logger.logkv("values", value)
     logger.dumpkvs()
