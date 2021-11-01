@@ -1,615 +1,502 @@
-import datetime
-import json
 import os
 import sys
+import shutil
+import os.path as osp
+import json
+import time
+import datetime
 import tempfile
-import warnings
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Sequence, TextIO, Tuple, Union
-
-import numpy as np
-import pandas
-import torch as th
-from matplotlib import pyplot as plt
-
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except ImportError:
-    SummaryWriter = None
+from contextlib import contextmanager
 
 DEBUG = 10
 INFO = 20
 WARN = 30
 ERROR = 40
+
 DISABLED = 50
 
-
-class Video(object):
-    """
-    Video data class storing the video frames and the frame per seconds
-
-    :param frames: frames to create the video from
-    :param fps: frames per second
-    """
-
-    def __init__(self, frames: th.Tensor, fps: Union[float, int]):
-        self.frames = frames
-        self.fps = fps
-
-
-class Figure(object):
-    """
-    Figure data class storing a matplotlib figure and whether to close the figure after logging it
-
-    :param figure: figure to log
-    :param close: if true, close the figure after logging it
-    """
-
-    def __init__(self, figure: plt.figure, close: bool):
-        self.figure = figure
-        self.close = close
-
-
-class Image(object):
-    """
-    Image data class storing an image and data format
-
-    :param image: image to log
-    :param dataformats: Image data format specification of the form NCHW, NHWC, CHW, HWC, HW, WH, etc.
-        More info in add_image method doc at https://pytorch.org/docs/stable/tensorboard.html
-        Gym envs normally use 'HWC' (channel last)
-    """
-
-    def __init__(self, image: Union[th.Tensor, np.ndarray, str], dataformats: str):
-        self.image = image
-        self.dataformats = dataformats
-
-
-class FormatUnsupportedError(NotImplementedError):
-    def __init__(self, unsupported_formats: Sequence[str], value_description: str):
-        if len(unsupported_formats) > 1:
-            format_str = f"formats {', '.join(unsupported_formats)} are"
-        else:
-            format_str = f"format {unsupported_formats[0]} is"
-        super(FormatUnsupportedError, self).__init__(
-            f"The {format_str} not supported for the {value_description} value logged.\n"
-            f"You can exclude formats via the `exclude` parameter of the logger's `record` function."
-        )
-
-
 class KVWriter(object):
-    """
-    Key Value writer
-    """
-
-    def write(self, key_values: Dict[str, Any], key_excluded: Dict[str, Union[str, Tuple[str, ...]]], step: int = 0) -> None:
-        """
-        Write a dictionary to file
-
-        :param key_values:
-        :param key_excluded:
-        :param step:
-        """
+    def writekvs(self, kvs):
         raise NotImplementedError
-
-    def close(self) -> None:
-        """
-        Close owned resources
-        """
-        raise NotImplementedError
-
 
 class SeqWriter(object):
-    """
-    sequence writer
-    """
-
-    def write_sequence(self, sequence: List) -> None:
-        """
-        write_sequence an array to file
-
-        :param sequence:
-        """
+    def writeseq(self, seq):
         raise NotImplementedError
 
-
 class HumanOutputFormat(KVWriter, SeqWriter):
-    def __init__(self, filename_or_file: Union[str, TextIO]):
-        """
-        log to a file, in a human readable format
-
-        :param filename_or_file: the file to write the log to
-        """
+    def __init__(self, filename_or_file):
         if isinstance(filename_or_file, str):
-            self.file = open(filename_or_file, "wt")
+            self.file = open(filename_or_file, 'wt')
             self.own_file = True
         else:
-            assert hasattr(filename_or_file, "write"), f"Expected file or str, got {filename_or_file}"
+            assert hasattr(filename_or_file, 'read'), 'expected file or str, got %s'%filename_or_file
             self.file = filename_or_file
             self.own_file = False
 
-    def write(self, key_values: Dict, key_excluded: Dict, step: int = 0) -> None:
+    def writekvs(self, kvs):
         # Create strings for printing
         key2str = {}
-        tag = None
-        for (key, value), (_, excluded) in zip(sorted(key_values.items()), sorted(key_excluded.items())):
-
-            if excluded is not None and ("stdout" in excluded or "log" in excluded):
-                continue
-
-            elif isinstance(value, Video):
-                raise FormatUnsupportedError(["stdout", "log"], "video")
-
-            elif isinstance(value, Figure):
-                raise FormatUnsupportedError(["stdout", "log"], "figure")
-
-            elif isinstance(value, Image):
-                raise FormatUnsupportedError(["stdout", "log"], "image")
-
-            elif isinstance(value, float):
-                # Align left
-                value_str = f"{value:<8.3g}"
+        for (key, val) in sorted(kvs.items()):
+            if hasattr(val, '__float__'):
+                valstr = '%-8.3g' % val
             else:
-                value_str = str(value)
-
-            if key.find("/") > 0:  # Find tag and add it to the dict
-                tag = key[: key.find("/") + 1]
-                key2str[self._truncate(tag)] = ""
-            # Remove tag from key
-            if tag is not None and tag in key:
-                key = str("   " + key[len(tag) :])
-
-            key2str[self._truncate(key)] = self._truncate(value_str)
+                valstr = str(val)
+            key2str[self._truncate(key)] = self._truncate(valstr)
 
         # Find max widths
         if len(key2str) == 0:
-            warnings.warn("Tried to write empty key-value dict")
+            print('WARNING: tried to write empty key-value dict')
             return
         else:
-            key_width = max(map(len, key2str.keys()))
-            val_width = max(map(len, key2str.values()))
+            keywidth = max(map(len, key2str.keys()))
+            valwidth = max(map(len, key2str.values()))
 
         # Write out the data
-        dashes = "-" * (key_width + val_width + 7)
+        dashes = '-' * (keywidth + valwidth + 7)
         lines = [dashes]
-        for key, value in key2str.items():
-            key_space = " " * (key_width - len(key))
-            val_space = " " * (val_width - len(value))
-            lines.append(f"| {key}{key_space} | {value}{val_space} |")
+        for (key, val) in sorted(key2str.items(), key=lambda kv: kv[0].lower()):
+            lines.append('| %s%s | %s%s |' % (
+                key,
+                ' ' * (keywidth - len(key)),
+                val,
+                ' ' * (valwidth - len(val)),
+            ))
         lines.append(dashes)
-        self.file.write("\n".join(lines) + "\n")
+        self.file.write('\n'.join(lines) + '\n')
 
         # Flush the output to the file
         self.file.flush()
 
-    @classmethod
-    def _truncate(cls, string: str, max_length: int = 23) -> str:
-        return string[: max_length - 3] + "..." if len(string) > max_length else string
+    def _truncate(self, s):
+        maxlen = 30
+        return s[:maxlen-3] + '...' if len(s) > maxlen else s
 
-    def write_sequence(self, sequence: List) -> None:
-        sequence = list(sequence)
-        for i, elem in enumerate(sequence):
+    def writeseq(self, seq):
+        seq = list(seq)
+        for (i, elem) in enumerate(seq):
             self.file.write(elem)
-            if i < len(sequence) - 1:  # add space unless this is the last one
-                self.file.write(" ")
-        self.file.write("\n")
+            if i < len(seq) - 1: # add space unless this is the last one
+                self.file.write(' ')
+        self.file.write('\n')
         self.file.flush()
 
-    def close(self) -> None:
-        """
-        closes the file
-        """
+    def close(self):
         if self.own_file:
             self.file.close()
 
-
-def filter_excluded_keys(
-    key_values: Dict[str, Any], key_excluded: Dict[str, Union[str, Tuple[str, ...]]], _format: str
-) -> Dict[str, Any]:
-    """
-    Filters the keys specified by ``key_exclude`` for the specified format
-
-    :param key_values: log dictionary to be filtered
-    :param key_excluded: keys to be excluded per format
-    :param _format: format for which this filter is run
-    :return: dict without the excluded keys
-    """
-
-    def is_excluded(key: str) -> bool:
-        return key in key_excluded and key_excluded[key] is not None and _format in key_excluded[key]
-
-    return {key: value for key, value in key_values.items() if not is_excluded(key)}
-
-
 class JSONOutputFormat(KVWriter):
-    def __init__(self, filename: str):
-        """
-        log to a file, in the JSON format
+    def __init__(self, filename):
+        self.file = open(filename, 'wt')
 
-        :param filename: the file to write the log to
-        """
-        self.file = open(filename, "wt")
-
-    def write(self, key_values: Dict[str, Any], key_excluded: Dict[str, Union[str, Tuple[str, ...]]], step: int = 0) -> None:
-        def cast_to_json_serializable(value: Any):
-            if isinstance(value, Video):
-                raise FormatUnsupportedError(["json"], "video")
-            if isinstance(value, Figure):
-                raise FormatUnsupportedError(["json"], "figure")
-            if isinstance(value, Image):
-                raise FormatUnsupportedError(["json"], "image")
-            if hasattr(value, "dtype"):
-                if value.shape == () or len(value) == 1:
-                    # if value is a dimensionless numpy array or of length 1, serialize as a float
-                    return float(value)
-                else:
-                    # otherwise, a value is a numpy array, serialize as a list or nested lists
-                    return value.tolist()
-            return value
-
-        key_values = {
-            key: cast_to_json_serializable(value)
-            for key, value in filter_excluded_keys(key_values, key_excluded, "json").items()
-        }
-        self.file.write(json.dumps(key_values) + "\n")
+    def writekvs(self, kvs):
+        for k, v in sorted(kvs.items()):
+            if hasattr(v, 'dtype'):
+                kvs[k] = float(v)
+        self.file.write(json.dumps(kvs) + '\n')
         self.file.flush()
 
-    def close(self) -> None:
-        """
-        closes the file
-        """
-
+    def close(self):
         self.file.close()
 
-
 class CSVOutputFormat(KVWriter):
-    def __init__(self, filename: str):
-        """
-        log to a file, in a CSV format
-
-        :param filename: the file to write the log to
-        """
-
-        self.file = open(filename, "w+t")
+    def __init__(self, filename):
+        self.file = open(filename, 'w+t')
         self.keys = []
-        self.separator = ","
-        self.quotechar = '"'
+        self.sep = ','
 
-    def write(self, key_values: Dict[str, Any], key_excluded: Dict[str, Union[str, Tuple[str, ...]]], step: int = 0) -> None:
+    def writekvs(self, kvs):
         # Add our current row to the history
-        key_values = filter_excluded_keys(key_values, key_excluded, "csv")
-        extra_keys = key_values.keys() - self.keys
+        extra_keys = list(kvs.keys() - self.keys)
+        extra_keys.sort()
         if extra_keys:
             self.keys.extend(extra_keys)
             self.file.seek(0)
             lines = self.file.readlines()
             self.file.seek(0)
-            for (i, key) in enumerate(self.keys):
+            for (i, k) in enumerate(self.keys):
                 if i > 0:
-                    self.file.write(",")
-                self.file.write(key)
-            self.file.write("\n")
+                    self.file.write(',')
+                self.file.write(k)
+            self.file.write('\n')
             for line in lines[1:]:
                 self.file.write(line[:-1])
-                self.file.write(self.separator * len(extra_keys))
-                self.file.write("\n")
-        for i, key in enumerate(self.keys):
+                self.file.write(self.sep * len(extra_keys))
+                self.file.write('\n')
+        for (i, k) in enumerate(self.keys):
             if i > 0:
-                self.file.write(",")
-            value = key_values.get(key)
-
-            if isinstance(value, Video):
-                raise FormatUnsupportedError(["csv"], "video")
-
-            elif isinstance(value, Figure):
-                raise FormatUnsupportedError(["csv"], "figure")
-
-            elif isinstance(value, Image):
-                raise FormatUnsupportedError(["csv"], "image")
-
-            elif isinstance(value, str):
-                # escape quotechars by prepending them with another quotechar
-                value = value.replace(self.quotechar, self.quotechar + self.quotechar)
-
-                # additionally wrap text with quotechars so that any delimiters in the text are ignored by csv readers
-                self.file.write(self.quotechar + value + self.quotechar)
-
-            elif value is not None:
-                self.file.write(str(value))
-        self.file.write("\n")
+                self.file.write(',')
+            v = kvs.get(k)
+            if v is not None:
+                self.file.write(str(v))
+        self.file.write('\n')
         self.file.flush()
 
-    def close(self) -> None:
-        """
-        closes the file
-        """
+    def close(self):
         self.file.close()
 
 
 class TensorBoardOutputFormat(KVWriter):
-    def __init__(self, folder: str):
-        """
-        Dumps key/value pairs into TensorBoard's numeric format.
+    """
+    Dumps key/value pairs into TensorBoard's numeric format.
+    """
+    def __init__(self, dir):
+        os.makedirs(dir, exist_ok=True)
+        self.dir = dir
+        self.step = 1
+        prefix = 'events'
+        path = osp.join(osp.abspath(dir), prefix)
+        import tensorflow as tf
+        from tensorflow.python import pywrap_tensorflow
+        from tensorflow.core.util import event_pb2
+        from tensorflow.python.util import compat
+        self.tf = tf
+        self.event_pb2 = event_pb2
+        self.pywrap_tensorflow = pywrap_tensorflow
+        self.writer = pywrap_tensorflow.EventsWriter(compat.as_bytes(path))
 
-        :param folder: the folder to write the log to
-        """
-        assert SummaryWriter is not None, "tensorboard is not installed, you can use " "pip install tensorboard to do so"
-        self.writer = SummaryWriter(log_dir=folder)
+    def writekvs(self, kvs):
+        def summary_val(k, v):
+            kwargs = {'tag': k, 'simple_value': float(v)}
+            return self.tf.Summary.Value(**kwargs)
+        summary = self.tf.Summary(value=[summary_val(k, v) for k, v in kvs.items()])
+        event = self.event_pb2.Event(wall_time=time.time(), summary=summary)
+        event.step = self.step # is there any reason why you'd want to specify the step?
+        self.writer.WriteEvent(event)
+        self.writer.Flush()
+        self.step += 1
 
-    def write(self, key_values: Dict[str, Any], key_excluded: Dict[str, Union[str, Tuple[str, ...]]], step: int = 0) -> None:
-
-        for (key, value), (_, excluded) in zip(sorted(key_values.items()), sorted(key_excluded.items())):
-
-            if excluded is not None and "tensorboard" in excluded:
-                continue
-
-            if isinstance(value, np.ScalarType):
-                if isinstance(value, str):
-                    # str is considered a np.ScalarType
-                    self.writer.add_text(key, value, step)
-                else:
-                    self.writer.add_scalar(key, value, step)
-
-            if isinstance(value, th.Tensor):
-                self.writer.add_histogram(key, value, step)
-
-            if isinstance(value, Video):
-                self.writer.add_video(key, value.frames, step, value.fps)
-
-            if isinstance(value, Figure):
-                self.writer.add_figure(key, value.figure, step, close=value.close)
-
-            if isinstance(value, Image):
-                self.writer.add_image(key, value.image, step, dataformats=value.dataformats)
-
-        # Flush the output to the file
-        self.writer.flush()
-
-    def close(self) -> None:
-        """
-        closes the file
-        """
+    def close(self):
         if self.writer:
-            self.writer.close()
+            self.writer.Close()
             self.writer = None
 
-
-def make_output_format(_format: str, log_dir: str, log_suffix: str = "") -> KVWriter:
-    """
-    return a logger for the requested format
-
-    :param _format: the requested format to log to ('stdout', 'log', 'json' or 'csv' or 'tensorboard')
-    :param log_dir: the logging directory
-    :param log_suffix: the suffix for the log file
-    :return: the logger
-    """
-    os.makedirs(log_dir, exist_ok=True)
-    if _format == "stdout":
+def make_output_format(format, ev_dir, log_suffix=''):
+    os.makedirs(ev_dir, exist_ok=True)
+    if format == 'stdout':
         return HumanOutputFormat(sys.stdout)
-    elif _format == "log":
-        return HumanOutputFormat(os.path.join(log_dir, f"log{log_suffix}.txt"))
-    elif _format == "json":
-        return JSONOutputFormat(os.path.join(log_dir, f"progress{log_suffix}.json"))
-    elif _format == "csv":
-        return CSVOutputFormat(os.path.join(log_dir, f"progress{log_suffix}.csv"))
-    elif _format == "tensorboard":
-        return TensorBoardOutputFormat(log_dir)
+    elif format == 'log':
+        return HumanOutputFormat(osp.join(ev_dir, 'log%s.txt' % log_suffix))
+    elif format == 'json':
+        return JSONOutputFormat(osp.join(ev_dir, 'progress%s.json' % log_suffix))
+    elif format == 'csv':
+        return CSVOutputFormat(osp.join(ev_dir, 'progress%s.csv' % log_suffix))
+    elif format == 'tensorboard':
+        return TensorBoardOutputFormat(osp.join(ev_dir, 'tb%s' % log_suffix))
     else:
-        raise ValueError(f"Unknown format specified: {_format}")
+        raise ValueError('Unknown format specified: %s' % (format,))
+
+# ================================================================
+# API
+# ================================================================
+
+def logkv(key, val):
+    """
+    Log a value of some diagnostic
+    Call this once for each diagnostic quantity, each iteration
+    If called many times, last value will be used.
+    """
+    get_current().logkv(key, val)
+
+def logkv_mean(key, val):
+    """
+    The same as logkv(), but if called many times, values averaged.
+    """
+    get_current().logkv_mean(key, val)
+
+def logkvs(d):
+    """
+    Log a dictionary of key-value pairs
+    """
+    for (k, v) in d.items():
+        logkv(k, v)
+
+def dumpkvs():
+    """
+    Write all of the diagnostics from the current iteration
+    """
+    return get_current().dumpkvs()
+
+def getkvs():
+    return get_current().name2val
+
+
+def log(*args, level=INFO):
+    """
+    Write the sequence of args, with no separators, to the console and output files (if you've configured an output file).
+    """
+    get_current().log(*args, level=level)
+
+def debug(*args):
+    log(*args, level=DEBUG)
+
+def info(*args):
+    log(*args, level=INFO)
+
+def warn(*args):
+    log(*args, level=WARN)
+
+def error(*args):
+    log(*args, level=ERROR)
+
+
+def set_level(level):
+    """
+    Set logging threshold on current logger.
+    """
+    get_current().set_level(level)
+
+def set_comm(comm):
+    get_current().set_comm(comm)
+
+def get_dir():
+    """
+    Get directory that log files are being written to.
+    will be None if there is no output directory (i.e., if you didn't call start)
+    """
+    return get_current().get_dir()
+
+record_tabular = logkv
+dump_tabular = dumpkvs
+
+@contextmanager
+def profile_kv(scopename):
+    logkey = 'wait_' + scopename
+    tstart = time.time()
+    try:
+        yield
+    finally:
+        get_current().name2val[logkey] += time.time() - tstart
+
+def profile(n):
+    """
+    Usage:
+    @profile("my_func")
+    def my_func(): code
+    """
+    def decorator_with_name(func):
+        def func_wrapper(*args, **kwargs):
+            with profile_kv(n):
+                return func(*args, **kwargs)
+        return func_wrapper
+    return decorator_with_name
 
 
 # ================================================================
 # Backend
 # ================================================================
 
+def get_current():
+    if Logger.CURRENT is None:
+        _configure_default_logger()
+
+    return Logger.CURRENT
+
 
 class Logger(object):
-    """
-    The logger class.
+    DEFAULT = None  # A logger with no output files. (See right below class definition)
+                    # So that you can still log to the terminal without setting up any output files
+    CURRENT = None  # Current logger being used by the free functions above
 
-    :param folder: the logging location
-    :param output_formats: the list of output formats
-    """
-
-    def __init__(self, folder: Optional[str], output_formats: List[KVWriter]):
-        self.name_to_value = defaultdict(float)  # values this iteration
-        self.name_to_count = defaultdict(int)
-        self.name_to_excluded = defaultdict(str)
+    def __init__(self, dir, output_formats, comm=None):
+        self.name2val = defaultdict(float)  # values this iteration
+        self.name2cnt = defaultdict(int)
         self.level = INFO
-        self.dir = folder
+        self.dir = dir
         self.output_formats = output_formats
+        self.comm = comm
 
-    def record(self, key: str, value: Any, exclude: Optional[Union[str, Tuple[str, ...]]] = None) -> None:
-        """
-        Log a value of some diagnostic
-        Call this once for each diagnostic quantity, each iteration
-        If called many times, last value will be used.
+    # Logging API, forwarded
+    # ----------------------------------------
+    def logkv(self, key, val):
+        self.name2val[key] = val
 
-        :param key: save to log this key
-        :param value: save to log this value
-        :param exclude: outputs to be excluded
-        """
-        self.name_to_value[key] = value
-        self.name_to_excluded[key] = exclude
+    def logkv_mean(self, key, val):
+        oldval, cnt = self.name2val[key], self.name2cnt[key]
+        self.name2val[key] = oldval*cnt/(cnt+1) + val/(cnt+1)
+        self.name2cnt[key] = cnt + 1
 
-    def record_mean(self, key: str, value: Any, exclude: Optional[Union[str, Tuple[str, ...]]] = None) -> None:
-        """
-        The same as record(), but if called many times, values averaged.
+    def dumpkvs(self):
+        if self.comm is None:
+            d = self.name2val
+        else:
+            from baselines.common import mpi_util
+            d = mpi_util.mpi_weighted_mean(self.comm,
+                {name : (val, self.name2cnt.get(name, 1))
+                    for (name, val) in self.name2val.items()})
+            if self.comm.rank != 0:
+                d['dummy'] = 1 # so we don't get a warning about empty dict
+        out = d.copy() # Return the dict for unit testing purposes
+        for fmt in self.output_formats:
+            if isinstance(fmt, KVWriter):
+                fmt.writekvs(d)
+        self.name2val.clear()
+        self.name2cnt.clear()
+        return out
 
-        :param key: save to log this key
-        :param value: save to log this value
-        :param exclude: outputs to be excluded
-        """
-        if value is None:
-            self.name_to_value[key] = None
-            return
-        old_val, count = self.name_to_value[key], self.name_to_count[key]
-        self.name_to_value[key] = old_val * count / (count + 1) + value / (count + 1)
-        self.name_to_count[key] = count + 1
-        self.name_to_excluded[key] = exclude
-
-    def dump(self, step: int = 0) -> None:
-        """
-        Write all of the diagnostics from the current iteration
-        """
-        if self.level == DISABLED:
-            return
-        for _format in self.output_formats:
-            if isinstance(_format, KVWriter):
-                _format.write(self.name_to_value, self.name_to_excluded, step)
-
-        self.name_to_value.clear()
-        self.name_to_count.clear()
-        self.name_to_excluded.clear()
-
-    def log(self, *args, level: int = INFO) -> None:
-        """
-        Write the sequence of args, with no separators,
-        to the console and output files (if you've configured an output file).
-
-        level: int. (see logger.py docs) If the global logger level is higher than
-                    the level argument here, don't print to stdout.
-
-        :param args: log the arguments
-        :param level: the logging level (can be DEBUG=10, INFO=20, WARN=30, ERROR=40, DISABLED=50)
-        """
+    def log(self, *args, level=INFO):
         if self.level <= level:
             self._do_log(args)
 
-    def debug(self, *args) -> None:
-        """
-        Write the sequence of args, with no separators,
-        to the console and output files (if you've configured an output file).
-        Using the DEBUG level.
-
-        :param args: log the arguments
-        """
-        self.log(*args, level=DEBUG)
-
-    def info(self, *args) -> None:
-        """
-        Write the sequence of args, with no separators,
-        to the console and output files (if you've configured an output file).
-        Using the INFO level.
-
-        :param args: log the arguments
-        """
-        self.log(*args, level=INFO)
-
-    def warn(self, *args) -> None:
-        """
-        Write the sequence of args, with no separators,
-        to the console and output files (if you've configured an output file).
-        Using the WARN level.
-
-        :param args: log the arguments
-        """
-        self.log(*args, level=WARN)
-
-    def error(self, *args) -> None:
-        """
-        Write the sequence of args, with no separators,
-        to the console and output files (if you've configured an output file).
-        Using the ERROR level.
-
-        :param args: log the arguments
-        """
-        self.log(*args, level=ERROR)
-
     # Configuration
     # ----------------------------------------
-    def set_level(self, level: int) -> None:
-        """
-        Set logging threshold on current logger.
-
-        :param level: the logging level (can be DEBUG=10, INFO=20, WARN=30, ERROR=40, DISABLED=50)
-        """
+    def set_level(self, level):
         self.level = level
 
-    def get_dir(self) -> str:
-        """
-        Get directory that log files are being written to.
-        will be None if there is no output directory (i.e., if you didn't call start)
+    def set_comm(self, comm):
+        self.comm = comm
 
-        :return: the logging directory
-        """
+    def get_dir(self):
         return self.dir
 
-    def close(self) -> None:
-        """
-        closes the file
-        """
-        for _format in self.output_formats:
-            _format.close()
+    def close(self):
+        for fmt in self.output_formats:
+            fmt.close()
 
     # Misc
     # ----------------------------------------
-    def _do_log(self, args) -> None:
-        """
-        log to the requested format outputs
+    def _do_log(self, args):
+        for fmt in self.output_formats:
+            if isinstance(fmt, SeqWriter):
+                fmt.writeseq(map(str, args))
 
-        :param args: the arguments to log
-        """
-        for _format in self.output_formats:
-            if isinstance(_format, SeqWriter):
-                _format.write_sequence(map(str, args))
+def get_rank_without_mpi_import():
+    # check environment variables here instead of importing mpi4py
+    # to avoid calling MPI_Init() when this module is imported
+    for varname in ['PMI_RANK', 'OMPI_COMM_WORLD_RANK']:
+        if varname in os.environ:
+            return int(os.environ[varname])
+    return 0
 
 
-def configure(folder: Optional[str] = None, format_strings: Optional[List[str]] = None) -> Logger:
+def configure(dir=None, format_strs=None, comm=None, log_suffix=''):
     """
-    Configure the current logger.
-
-    :param folder: the save location
-        (if None, $SB3_LOGDIR, if still None, tempdir/SB3-[date & time])
-    :param format_strings: the output logging format
-        (if None, $SB3_LOG_FORMAT, if still None, ['stdout', 'log', 'csv'])
-    :return: The logger object.
+    If comm is provided, average all numerical stats across that comm
     """
-    if folder is None:
-        folder = os.getenv("SB3_LOGDIR")
-    if folder is None:
-        folder = os.path.join(tempfile.gettempdir(), datetime.datetime.now().strftime("SB3-%Y-%m-%d-%H-%M-%S-%f"))
-    assert isinstance(folder, str)
-    os.makedirs(folder, exist_ok=True)
+    if dir is None:
+        dir = os.getenv('OPENAI_LOGDIR')
+    if dir is None:
+        dir = osp.join(tempfile.gettempdir(),
+            datetime.datetime.now().strftime("openai-%Y-%m-%d-%H-%M-%S-%f"))
+    assert isinstance(dir, str)
+    dir = os.path.expanduser(dir)
+    os.makedirs(os.path.expanduser(dir), exist_ok=True)
 
-    log_suffix = ""
-    if format_strings is None:
-        format_strings = os.getenv("SB3_LOG_FORMAT", "stdout,log,csv").split(",")
+    rank = get_rank_without_mpi_import()
+    if rank > 0:
+        log_suffix = log_suffix + "-rank%03i" % rank
 
-    format_strings = list(filter(None, format_strings))
-    output_formats = [make_output_format(f, folder, log_suffix) for f in format_strings]
+    if format_strs is None:
+        if rank == 0:
+            format_strs = os.getenv('OPENAI_LOG_FORMAT', 'stdout,log,csv').split(',')
+        else:
+            format_strs = os.getenv('OPENAI_LOG_FORMAT_MPI', 'log').split(',')
+    format_strs = filter(None, format_strs)
+    output_formats = [make_output_format(f, dir, log_suffix) for f in format_strs]
 
-    logger = Logger(folder=folder, output_formats=output_formats)
-    # Only print when some files will be saved
-    if len(format_strings) > 0 and format_strings != ["stdout"]:
-        logger.log(f"Logging to {folder}")
-    return logger
+    Logger.CURRENT = Logger(dir=dir, output_formats=output_formats, comm=comm)
+    if output_formats:
+        log('Logging to %s'%dir)
+
+def _configure_default_logger():
+    configure()
+    Logger.DEFAULT = Logger.CURRENT
+
+def reset():
+    if Logger.CURRENT is not Logger.DEFAULT:
+        Logger.CURRENT.close()
+        Logger.CURRENT = Logger.DEFAULT
+        log('Reset logger')
+
+@contextmanager
+def scoped_configure(dir=None, format_strs=None, comm=None):
+    prevlogger = Logger.CURRENT
+    configure(dir=dir, format_strs=format_strs, comm=comm)
+    try:
+        yield
+    finally:
+        Logger.CURRENT.close()
+        Logger.CURRENT = prevlogger
+
+# ================================================================
+
+def _demo():
+    info("hi")
+    debug("shouldn't appear")
+    set_level(DEBUG)
+    debug("should appear")
+    dir = "testlogging"
+    if os.path.exists(dir):
+        shutil.rmtree(dir)
+    configure(dir=dir)
+    logkv("a", 3)
+    logkv("b", 2.5)
+    dumpkvs()
+    logkv("b", -2.5)
+    logkv("a", 5.5)
+    dumpkvs()
+    info("^^^ should see a = 5.5")
+    logkv_mean("b", -22.5)
+    logkv_mean("b", -44.4)
+    logkv("a", 5.5)
+    dumpkvs()
+    info("^^^ should see b = -33.3")
+
+    logkv("b", -2.5)
+    dumpkvs()
+
+    logkv("a", "longasslongasslongasslongasslongasslongassvalue")
+    dumpkvs()
 
 
 # ================================================================
 # Readers
 # ================================================================
 
+def read_json(fname):
+    import pandas
+    ds = []
+    with open(fname, 'rt') as fh:
+        for line in fh:
+            ds.append(json.loads(line))
+    return pandas.DataFrame(ds)
 
-def read_json(filename: str) -> pandas.DataFrame:
+def read_csv(fname):
+    import pandas
+    return pandas.read_csv(fname, index_col=None, comment='#')
+
+def read_tb(path):
     """
-    read a json file using pandas
-
-    :param filename: the file path to read
-    :return: the data in the json
+    path : a tensorboard file OR a directory, where we will find all TB files
+           of the form events.*
     """
-    data = []
-    with open(filename, "rt") as file_handler:
-        for line in file_handler:
-            data.append(json.loads(line))
-    return pandas.DataFrame(data)
+    import pandas
+    import numpy as np
+    from glob import glob
+    import tensorflow as tf
+    if osp.isdir(path):
+        fnames = glob(osp.join(path, "events.*"))
+    elif osp.basename(path).startswith("events."):
+        fnames = [path]
+    else:
+        raise NotImplementedError("Expected tensorboard file or directory containing them. Got %s"%path)
+    tag2pairs = defaultdict(list)
+    maxstep = 0
+    for fname in fnames:
+        for summary in tf.train.summary_iterator(fname):
+            if summary.step > 0:
+                for v in summary.summary.value:
+                    pair = (summary.step, v.simple_value)
+                    tag2pairs[v.tag].append(pair)
+                maxstep = max(summary.step, maxstep)
+    data = np.empty((maxstep, len(tag2pairs)))
+    data[:] = np.nan
+    tags = sorted(tag2pairs.keys())
+    for (colidx,tag) in enumerate(tags):
+        pairs = tag2pairs[tag]
+        for (step, value) in pairs:
+            data[step-1, colidx] = value
+    return pandas.DataFrame(data, columns=tags)
 
-
-def read_csv(filename: str) -> pandas.DataFrame:
-    """
-    read a csv file using pandas
-
-    :param filename: the file path to read
-    :return: the data in the csv
-    """
-    return pandas.read_csv(filename, index_col=None, comment="#")
+if __name__ == "__main__":
+    _demo()
