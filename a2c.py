@@ -5,6 +5,9 @@ from IPython.display import clear_output
 from IPython.core.debugger import set_trace
 #import matplotlib.pyplot as plt
 import atari_wrappers as wrappers
+import logger
+import shutil
+import os
 
 max_frames = 5000000
 batch_size = 5
@@ -14,6 +17,15 @@ entropy_coef = 0.01
 critic_coef = 0.5
 env_name = 'PongNoFrameskip-v4'
 no_of_workers = 16
+DEBUG = 10
+
+
+# Setup logging for the model
+logger.set_level(DEBUG)
+dir = "logs"
+if os.path.exists(dir):
+    shutil.rmtree(dir)
+logger.configure(dir=dir)
 
 if torch.cuda.is_available():
     FloatTensor = torch.cuda.FloatTensor
@@ -173,6 +185,8 @@ class Worker(object):
         values = compute_true_values(states, rewards, dones).unsqueeze(1)
         return states, actions, values
 
+
+
 model = Model(env.action_space.n).cuda()
 # optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate, eps=1e-5)
@@ -187,6 +201,7 @@ data = {
 }
 state = FloatTensor(env.reset())
 episode_reward = 0
+
 while frame_idx < max_frames:
     for worker in workers:
         states, actions, true_values = worker.get_batch()
@@ -199,5 +214,9 @@ while frame_idx < max_frames:
         frame_idx += batch_size
         
     value = reflect(memory)
-    if frame_idx % 1000 == 0:
-        print(value)
+   # if frame_idx % 1000 == 0:
+     #   print(value)
+    # Log every episode 
+    logger.logkv("episode_rewards", data['episode_rewards'])
+    logger.logkv("values", data['values'])
+    logger.dumpkvs()
