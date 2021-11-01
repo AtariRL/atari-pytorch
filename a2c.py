@@ -178,6 +178,7 @@ class Worker(object):
             if done:
                 self.state = FloatTensor(self.env.reset())
                 data['episode_rewards'].append(self.episode_reward)
+                logger.logkv("Episode Reward", self.episode_reward)
                 self.episode_reward = 0
             else:
                 self.state = FloatTensor(next_state)
@@ -214,9 +215,5 @@ while frame_idx < max_frames:
         frame_idx += batch_size
         
     value = reflect(memory)
-   # if frame_idx % 1000 == 0:
-     #   print(value)
-    # Log every episode 
     logger.logkv("frame", frame_idx)
-    logger.logkv("values", value)
     logger.dumpkvs()
