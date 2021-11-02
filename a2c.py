@@ -15,7 +15,7 @@ learning_rate = 7e-4
 gamma = 0.99
 entropy_coef = 0.01
 critic_coef = 0.5
-env_name = 'BreakoutNoFrameskip-v4'
+env_name = 'BeamRiderNoFrameskip-v4'
 no_of_workers = 16
 DEBUG = 10
 
