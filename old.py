@@ -1,24 +1,48 @@
-import time
-
-import gym
-import numpy as np
-
 import torch
-from torchsummary import summary    
 import torch.nn as nn
 import torch.nn.functional as F
-
-from stable_baselines3 import A2C
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecFrameStack
-from stable_baselines3.common.utils import set_random_seed
-from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.env_util import make_vec_env
-
-from typing import Callable
-from cmd_utils import *
-
-import shutil
+import gym
+import numpy as np
+from IPython.display import clear_output
+from IPython.core.debugger import set_trace
+#import matplotlib.pyplot as plt
+import atari_wrappers as wrappers
 import logger
+import shutil
+import os
+from torchsummary import summary
+
+max_frames = 5000000
+batch_size = 16
+learning_rate = 7e-4
+gamma = 0.99
+entropy_coef = 0.01
+critic_coef = 0.5
+env_name = 'BreakoutNoFrameskip-v4'
+no_of_workers = 16
+DEBUG = 10
+
+
+
+# Setup logging for the model
+logger.set_level(DEBUG)
+dir = "logs"
+if os.path.exists(dir):
+    shutil.rmtree(dir)
+logger.configure(dir=dir)
+
+if torch.cuda.is_available():
+    FloatTensor = torch.cuda.FloatTensor
+    LongTensor = torch.cuda.LongTensor
+else:
+    FloatTensor = torch.FloatTensor
+    LongTensor = torch.LongTensor
+
+
+env = wrappers.make_atari(env_name)
+env = wrappers.wrap_deepmind(env, scale=True)
+env = wrappers.wrap_pytorch(env)
+
 
 def ortho_weights(shape, scale=1.):
     """ PyTorch port of ortho_init from baselines.a2c.utils """
@@ -141,10 +165,8 @@ class AtariCNN(nn.Module):
         actor_features = m(actor_features)
         dist = torch.distributions.Categorical(actor_features)
         #print(actor_features)
-        # Provides an action probability for each environ
         chosen_action = dist.sample()
-        #print(type(chosen_action))
-        return chosen_action
+        return chosen_action.item()
 
 class Memory(object):
     def __init__(self):
@@ -164,17 +186,17 @@ class Memory(object):
         
         return states, actions, true_values
 
-def compute_true_values(states, rewards, dones, model):
 
-
+def compute_true_values(states, rewards, dones):
     R = []
     rewards = FloatTensor(rewards)
     dones = FloatTensor(dones)
     states = torch.stack(states)
-
-    #print("rewards : {} \ dones : {} \ states : {}".format(rewards.shape, dones.shape, states.shape))
     
-    next_value = model.get_critic(states[-1].unsqueeze(0))
+    if dones[-1] == True:
+        next_value = rewards[-1]
+    else:
+        next_value = model.get_critic(states[-1].unsqueeze(0))
         
     R.append(next_value)
     for i in reversed(range(0, len(rewards) - 1)):
@@ -188,39 +210,8 @@ def compute_true_values(states, rewards, dones, model):
     
     return FloatTensor(R)
 
-def get_batch(batch_size, model, state, env, episode_reward):
-        states, actions, rewards, dones, values = [], [], [], [], []
-        for _ in range(batch_size):
 
-            # Get action probability for each of the envs
-            actions = model.act(state)
-            actions = actions.cpu().numpy()
-            actions = list(actions)
-            next_state, reward, done, _ = env.step(actions)
-            episode_reward += reward
-
-            value = model.get_critic(state)
-
-            # Appends env x everything lol
-            states.append(state)
-            actions.append(actions)
-            rewards.append(reward)
-            dones.append(done)
-            values.append(value)
-            
-            if True in done:
-                state = FloatTensor(env.reset())
-                logger.logkv("Episode Reward", episode_reward)
-                episode_reward = 0
-            else:
-                state = FloatTensor(next_state)
-                logger.logkv("Episode Reward", episode_reward)
-                
-        #values = compute_true_values(states, rewards, dones, model).unsqueeze(1)
-        return states, actions, values, episode_reward
-
-
-def reflect(memory, model, optimizer):
+def reflect(memory):
     states, actions, true_values = memory.pop_all()
 
     values, log_probs, entropy = model.evaluate_action(states, actions)
@@ -239,38 +230,71 @@ def reflect(memory, model, optimizer):
     return values.mean().item()   
 
 
-def run():
-    
-    # There already exists an environment generator that will make and wrap atari environments correctly.
-    # We use 16 parallel processes
-    env = make_atari_env('BreakoutNoFrameskip-v4', n_envs=5, seed=0)
-    # Stack 4 frames
-    #env = VecFrameStack(env, n_stack=4)
+class Worker(object):
+    def __init__(self, env_name):
+        self.env = wrappers.make_atari(env_name)
+        self.env = wrappers.wrap_deepmind(self.env, frame_stack=True, scale=True)
 
-    #torch.Size([5, 84, 84, 4]) where 5 is num_env
-    # [5, 84, 84, 4] -> [5, 4, 84, 84]
-    state = FloatTensor(env.reset())
+        self.env = wrappers.wrap_pytorch(self.env)
+        self.episode_reward = 0
+        self.state = FloatTensor(self.env.reset())
+        
+    def get_batch(self):
+        states, actions, rewards, dones = [], [], [], []
+        for _ in range(batch_size):
+            #print("IN GET BATCH")
+            #print(self.state.shape)
 
-    #Breakout is 4, number of actions 
-    num_act = env.action_space.n
+            # UPDATE BOTH U FACKING BLISTERING IDIOT
+            #print(self.state.unsqueeze(0).shape)
 
-    learning_rate = 7e-4
-    max_frames = 5000000
+            print("ACTION PROB")
+            print(self.state.shape)
+            print("ACTION PROB2")
+            print(self.state.unsqueeze(0).shape)
+            action = model.act(self.state.unsqueeze(0))
+            next_state, reward, done, _ = self.env.step(action)
+            self.episode_reward += reward
 
-    #model = Model(num_act, env).cuda()
-    model = AtariCNN(num_act).cuda()
-    optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate, eps=1e-5)
+            states.append(self.state)
+            actions.append(action)
+            rewards.append(reward)
+            dones.append(done)
+            
+            if done:
+                self.state = FloatTensor(self.env.reset())
+                data['episode_rewards'].append(self.episode_reward)
+                logger.logkv("Episode Reward", self.episode_reward)
+                self.episode_reward = 0
+            else:
+                self.state = FloatTensor(next_state)
+                logger.logkv("Episode Reward", self.episode_reward)
+                
+        values = compute_true_values(states, rewards, dones).unsqueeze(1)
+        return states, actions, values
 
-    memory = Memory()
-    episode_reward = 0
-    frame_idx = 0
 
-    while frame_idx < max_frames:
-        states, actions, true_values, episode_reward = get_batch(32, model, state, env, episode_reward)
-        print("states : {} \ actions : {} \ true_values : {} \ episode_reward : {}".format(type(states), type(actions), type(true_values),type(episode_reward)))
-        print("states : {} \ actions : {} \ true_values : {} \ episode_reward : {}".format(type(states), actions, true_values,episode_reward))
 
-        exit()
+model = AtariCNN(env.action_space.n).cuda()
+
+#print(model.parameters())
+# optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate, eps=1e-5)
+memory = Memory()
+workers = []
+for _ in range(no_of_workers):
+    workers.append(Worker(env_name))
+frame_idx = 0
+data = {
+    'episode_rewards': [],
+    'values': []
+}
+state = FloatTensor(env.reset())
+episode_reward = 0
+
+while frame_idx < max_frames:
+    for worker in workers:
+        states, actions, true_values = worker.get_batch()
         for i, _ in enumerate(states):
             memory.push(
                 states[i],
@@ -279,29 +303,6 @@ def run():
             )
         frame_idx += batch_size
         
-    value = reflect(memory, model, optimizer)
+    value = reflect(memory)
     logger.logkv("frame", frame_idx)
-    logger.logkv("value", value)
     logger.dumpkvs()
-    
-if __name__ == "__main__":
-    DEBUG = 10
-    # Setup logging for the model
-    logger.set_level(DEBUG)
-    dir = "logs"
-    if os.path.exists(dir):
-        shutil.rmtree(dir)
-    logger.configure(dir=dir)
-    if torch.cuda.is_available():
-        FloatTensor = torch.cuda.FloatTensor
-        LongTensor = torch.cuda.LongTensor
-    else:
-        FloatTensor = torch.FloatTensor
-        LongTensor = torch.LongTensor
-
-    gamma = 0.99
-    batch_size = 32
-    entropy_coef = 0.01
-    critic_coef = 0.5
-    
-    run()

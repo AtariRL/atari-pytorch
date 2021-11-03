@@ -9,6 +9,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.atari_wrappers import AtariWrapper
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+import atari_wrappers as wrappers
 
 def make_vec_env(env_id: Union[str, Type[gym.Env]],
                  n_envs: int = 1,
@@ -103,7 +104,11 @@ def make_atari_env(env_id: Union[str, Type[gym.Env]],
         wrapper_kwargs = {}
 
     def atari_wrapper(env: gym.Env) -> gym.Env:
-        env = AtariWrapper(env, **wrapper_kwargs)
+        #env = AtariWrapper(env, **wrapper_kwargs)
+        #env = wrappers.wrap_pytorch(env)
+        env = wrappers.make_atari(env_id)
+        env = wrappers.wrap_deepmind(env, scale=True, frame_stack=True)
+        env = wrappers.wrap_pytorch(env)
         return env
 
     return make_vec_env(env_id, n_envs=n_envs, seed=seed, start_index=start_index,
