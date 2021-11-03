@@ -123,12 +123,11 @@ class AtariCNN(nn.Module):
     
     def evaluate_action(self, state, action):
         #print("EVAL")
+        action = torch.FloatTensor(action).cuda()
         value, actor_features = self.forward(state)
         m = nn.Softmax(dim=1)
         actor_features = m(actor_features)
-
         dist = torch.distributions.Categorical(actor_features)
-        
         log_probs = dist.log_prob(action).view(-1, 1)
         entropy = dist.entropy().mean()
         
@@ -158,7 +157,7 @@ class Memory(object):
     def pop_all(self):
         states = torch.stack(self.states)
         actions = LongTensor(self.actions)
-        true_values = FloatTensor(self.true_values).unsqueeze(1)
+        true_values = FloatTensor(self.true_values)
         
         self.states, self.actions, self.true_values = [], [], []
         
@@ -189,11 +188,13 @@ def compute_true_values(states, rewards, dones, model):
     return FloatTensor(R)
 
 def get_batch(batch_size, model, state, env, episode_reward):
-        states, actions, rewards, dones, values = [], [], [], [], []
+        states, action_list, rewards, dones, values = [], [], [], [], []
         for _ in range(batch_size):
 
             # Get action probability for each of the envs
             actions = model.act(state)
+            print("ACTIONS")
+            print(actions)
             actions = actions.cpu().numpy()
             actions = list(actions)
             next_state, reward, done, _ = env.step(actions)
@@ -203,7 +204,7 @@ def get_batch(batch_size, model, state, env, episode_reward):
 
             # Appends env x everything lol
             states.append(state)
-            actions.append(actions)
+            action_list.append(actions)
             rewards.append(reward)
             dones.append(done)
             values.append(value)
@@ -217,24 +218,32 @@ def get_batch(batch_size, model, state, env, episode_reward):
                 logger.logkv("Episode Reward", episode_reward)
                 
         #values = compute_true_values(states, rewards, dones, model).unsqueeze(1)
-        return states, actions, values, episode_reward
+        return states, action_list, values, episode_reward
 
 
-def reflect(memory, model, optimizer):
-    states, actions, true_values = memory.pop_all()
+def reflect(states, actions, true_values, model, optimizer):
+    print("REFLECT")
+    #print(memory)
 
-    values, log_probs, entropy = model.evaluate_action(states, actions)
+    #states, actions, true_values = memory.pop_all()
+    # for i 32 each state, action
+    print("Lengths : {}{}{}".format(len(states), len(actions), len(true_values)))
+    for i in range(len(states)):
+        values, log_probs, entropy = model.evaluate_action(states[i], actions[i])
 
-    advantages =  true_values - values
-    critic_loss = advantages.pow(2).mean()
+        advantages =  true_values[i] - values
+        #print("True value {} = Values {}".format(true_values[i] - values))
+        print(advantages)
+        critic_loss = advantages.pow(2).mean()
+        print(critic_loss)
 
-    actor_loss = -(log_probs * advantages.detach()).mean()
-    total_loss = (critic_coef * critic_loss) + actor_loss - (entropy_coef * entropy)
+        actor_loss = -(log_probs * advantages.detach()).mean()
+        total_loss = (critic_coef * critic_loss) + actor_loss - (entropy_coef * entropy)
 
-    optimizer.zero_grad()
-    total_loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-    optimizer.step()
+        optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        optimizer.step()
         
     return values.mean().item()   
 
@@ -265,21 +274,24 @@ def run():
     episode_reward = 0
     frame_idx = 0
 
-    while frame_idx < max_frames:
-        states, actions, true_values, episode_reward = get_batch(32, model, state, env, episode_reward)
-        print("states : {} \ actions : {} \ true_values : {} \ episode_reward : {}".format(type(states), type(actions), type(true_values),type(episode_reward)))
-        print("states : {} \ actions : {} \ true_values : {} \ episode_reward : {}".format(type(states), actions, true_values,episode_reward))
+    states, actions, true_values, episode_reward = get_batch(batch_size, model, state, env, episode_reward)
+   # print("TEST BEFORE : {} ".format(states[0].shape))
+    #exit()
+    #print("states : {} \ actions : {} \ true_values : {} \ episode_reward : {}".format(type(states), type(actions), type(true_values),type(episode_reward)))
+    # print("states : {} \ actions : {} \ true_values : {} \ episode_reward : {}".format(type(states), actions, true_values,episode_reward))
+    #print(len(states))
+    #print(len(actions))
+    #print(len(true_values))
+    '''
+    for i, _ in enumerate(states):
+        memory.push(
+            states[i],
+            actions[i],
+            true_values[i]
+        )
+    '''
+    value = reflect(states, actions, true_values, model, optimizer)
 
-        exit()
-        for i, _ in enumerate(states):
-            memory.push(
-                states[i],
-                actions[i],
-                true_values[i]
-            )
-        frame_idx += batch_size
-        
-    value = reflect(memory, model, optimizer)
     logger.logkv("frame", frame_idx)
     logger.logkv("value", value)
     logger.dumpkvs()
