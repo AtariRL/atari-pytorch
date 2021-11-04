@@ -9,11 +9,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from stable_baselines3 import A2C
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecFrameStack
+#from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecFrameStack
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.env_util import make_vec_env
-from torch.distributions import Categorical
+
+from a2c.multiprocessing_env import SubprocVecEnv, VecPyTorch, VecPyTorchFrameStack
+from a2c.wrappers import *
 
 from collections import deque
 
@@ -22,50 +24,6 @@ from cmd_utils import *
 
 import shutil
 import logger
-
-
-class ActorCritic(nn.Module):
-    def __init__(self, action_space):
-        super(ActorCritic, self).__init__()
-        observation_shape = (4, 84, 84)
-        n_actions = 4
-
-        self.features = nn.Sequential(
-            nn.Conv2d(observation_shape[0], 32, 8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 32, 3, stride=1),
-            nn.ReLU()
-        )
-
-        # self.gru = nn.GRUCell(32 * 7 * 7, 256)
-        self.linear = nn.Linear(32 * 7 * 7, 256)
-        self.actor = nn.Linear(256, n_actions)
-        self.critic = nn.Linear(256, 1)
-
-        for m in self.features:
-            if isinstance(m, nn.Conv2d):
-                nn.init.orthogonal_(m.weight, nn.init.calculate_gain('relu'))
-                nn.init.constant_(m.bias, 0.0)
-
-        nn.init.orthogonal_(self.linear.weight)
-        nn.init.constant_(self.linear.bias, 0.0)
-
-        nn.init.orthogonal_(self.critic.weight)
-        nn.init.constant_(self.critic.bias, 0.0)
-
-        nn.init.orthogonal_(self.actor.weight, 0.01)
-        nn.init.constant_(self.actor.bias, 0.0)
-
-    def forward(self, x):
-        x = self.features(x)
-        x = x.view(-1, 32 * 7 * 7)
-        x = self.linear(x)
-        x = F.relu(x)
-        # hx = self.gru(x, hx)
-        return Categorical(logits=self.actor(x)), self.critic(x)
-
 
 def ortho_weights(shape, scale=1.):
     """ PyTorch port of ortho_init from baselines.a2c.utils """
@@ -186,7 +144,7 @@ class AtariCNN(nn.Module):
 
 def compute_returns(next_value, rewards, masks, gamma):
     #rewards = torch.from_numpy(rewards)
-    rewards = [torch.from_numpy(item).float().cuda() for item in rewards]
+    #rewards = [torch.from_numpy(item).float().cuda() for item in rewards]
     r = next_value
     returns = []
     for step in reversed(range(len(rewards))):
@@ -195,19 +153,80 @@ def compute_returns(next_value, rewards, masks, gamma):
     return returns
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def make_env(seed, rank):
+    def _thunk():
+        env = gym.make(game)
+        env.seed(seed + rank)
+        assert "NoFrameskip" in game, "Require environment with no frameskip"
+        env = NoopResetEnv(env, noop_max=30)
+        env = MaxAndSkipEnv(env, skip=4)
 
-def own():
-    n_envs = 20
+        allow_early_resets = False
+        log_dir = m_log
+        assert m_log is not None, "Log directory required for Monitor! (which is required for episodic return reporting)"
+        try:
+            os.mkdir(log_dir)
+        except:
+            pass
+        env = Monitor(env, os.path.join(log_dir, str(rank)), allow_early_resets=allow_early_resets)
+
+        env = EpisodicLifeEnv(env)
+        if 'FIRE' in env.unwrapped.get_action_meanings():
+            env = FireResetEnv(env)
+        env = WarpFrame(env)
+        # env = PyTorchFrame(env)
+        env = ClipRewardEnv(env)
+        # env = FrameStack(env, 4)
+        obs_shape = env.observation_space.shape
+        if len(obs_shape) == 3 and obs_shape[2] in [1, 3]:
+            env = TransposeImage(env)
+
+        return env
+    return _thunk
+def make_envs():
+    envs = [make_env(seed, i) for i in range(n_envs)]
+    envs = SubprocVecEnv(envs)
+    envs = VecPyTorch(envs, device)
+    envs = VecPyTorchFrameStack(envs, 4, device)
+    return envs
+
+torch.autograd.set_detect_anomaly(True)
+
+if __name__ == "__main__":
+    DEBUG = 10
+    n_envs = 5
+    seed = 42
+    game = 'BreakoutNoFrameskip-v4'
+    m_log = 'qwe'
+    # Setup logging for the model
+    logger.set_level(DEBUG)
+    dir = "logs"
+    if os.path.exists(dir):
+        shutil.rmtree(dir)
+    logger.configure(dir=dir)
+
+    if torch.cuda.is_available():
+        FloatTensor = torch.cuda.FloatTensor
+        LongTensor = torch.cuda.LongTensor
+    else:
+        FloatTensor = torch.FloatTensor
+        LongTensor = torch.LongTensor
+
+    gamma = 0.99
+    batch_size = 32
+    entropy_coef = 0.01
+    critic_coef = 0.5
+
     n_steps = 5 # forward steps
     n_frames = int(10e6)
 
     num_updates = n_frames // n_steps // n_envs
 
-    envs = make_atari_env('BreakoutNoFrameskip-v4', n_envs=n_envs, seed=0)
+    #envs = make_atari_env('BreakoutNoFrameskip-v4', n_envs=n_envs, seed=0)
+    envs = make_envs()
 
-    num_act = envs.action_space.n
+    num_act = 4
     model = AtariCNN(num_act).cuda()
-    #model = ActorCritic(num_act).cuda()
     learning_rate = 7e-4
     optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate, eps=1e-5)
 
@@ -225,7 +244,6 @@ def own():
         entropies = []
 
         for step in range(n_steps):
-            #actor, value = actor_critic(observation)
             actions, entropy = model.act(observation)
             value = model.get_critic(observation)
             actions = actions.cpu().numpy()
@@ -243,7 +261,7 @@ def own():
             entropies.append(entropy)
             log_probs.append(log_prob)
             values.append(value.squeeze())
-            rewards.append(reward)
+            rewards.append(reward.to(device).squeeze())
             masks.append(mask)
 
             observation = observation = FloatTensor(next_observation)
@@ -270,6 +288,7 @@ def own():
         print(advantages)
         exit()
 
+
         actor_loss = -(log_probs * advantages.detach()).mean()
         critic_loss = advantages.pow(2).mean()
         entropy_loss = entropies.mean()
@@ -279,100 +298,8 @@ def own():
                0.01 * entropy_loss
 
         optimizer.zero_grad()
-        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-        optimizer.step()
-
-        if len(episode_rewards) > 1 and update % 100 == 0:
-            end = time.time()
-            total_num_steps = (update + 1) * n_envs * n_steps
-            print("********************************************************")
-            print("update: {0}, total steps: {1}, FPS: {2}".format(update, total_num_steps, int(total_num_steps / (end - start))))
-            print("mean/median reward: {:.1f}/{:.1f}".format(np.mean(episode_rewards), np.median(episode_rewards)))
-            print("min/max reward: {:.1f}/{:.1f}".format(np.min(episode_rewards), np.max(episode_rewards)))
-            print("actor loss: {:.5f}, critic loss: {:.5f}, entropy: {:.5f}".format(actor_loss.item(), critic_loss.item(), entropy_loss.item()))
-            print("********************************************************")
-
-
-def new():
-    n_envs = 20
-    n_steps = 5 # forward steps
-    n_frames = int(10e6)
-
-    num_updates = n_frames // n_steps // n_envs
-
-    envs = make_atari_env('BreakoutNoFrameskip-v4', n_envs=n_envs, seed=0)
-
-    num_act = 4
-    #model = AtariCNN(num_act).cuda()
-    actor_critic = ActorCritic(num_act).cuda()
-    learning_rate = 7e-4
-    optimizer = torch.optim.RMSprop(actor_critic.parameters(), lr=learning_rate, eps=1e-5)
-
-    observation = FloatTensor(envs.reset())
-    start = time.time()
-
-    episode_rewards = deque(maxlen=10)
-    for update in range(num_updates):
-
-        log_probs = []
-        values = []
-        rewards = []
-        actions = []
-        masks = []
-        entropies = []
-
-        for step in range(n_steps):
-            #actor, value = actor_critic(observation)
-            actor, value = actor_critic(observation)
-
-            action = actor.sample()
-            action = action.cpu().numpy()
-            action = list(action)
-            next_observation, reward, done, infos = envs.step(action)
-
-            for info in infos:
-                if 'episode' in info.keys():
-                    episode_rewards.append(info['episode']['r'])
-
-            log_prob = actor.log_prob(actor.sample())
-            entropy = actor.entropy()
-
-            mask = torch.from_numpy(1.0 - done).to(device).float()
-
-            #mask = torch.from_numpy(1.0 - done).to(device).float()
-
-            entropies.append(entropy)
-            log_probs.append(log_prob)
-            values.append(value.squeeze())
-            rewards.append(reward)
-            masks.append(mask)
-
-            observation = observation = FloatTensor(next_observation)
-
-        next_observation = FloatTensor(next_observation)
-        with torch.no_grad():
-            _, next_values = actor_critic(next_observation)
-            returns = compute_returns(next_values.squeeze(), rewards, masks, gamma)
-            returns = torch.cat(returns)
-
-        log_probs = torch.cat(log_probs)
-        values = torch.cat(values)
-        entropies = torch.cat(entropies)
-
-        advantages = returns - values
-
-        actor_loss = -(log_probs * advantages.detach()).mean()
-        critic_loss = advantages.pow(2).mean()
-        entropy_loss = entropies.mean()
-
-        loss = 1.0 * actor_loss + \
-               0.5 * critic_loss - \
-               0.01 * entropy_loss
-
-        optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), 0.5)
         optimizer.step()
 
         if len(episode_rewards) > 1 and update % 100 == 0:
@@ -384,24 +311,3 @@ def new():
             print("min/max reward: {:.1f}/{:.1f}".format(np.min(episode_rewards), np.max(episode_rewards)))
             print("actor loss: {:.5f}, critic loss: {:.5f}, entropy: {:.5f}".format(actor_loss.item(), critic_loss.item(), entropy_loss.item()))
             print("********************************************************")
-
-if __name__ == "__main__":
-    DEBUG = 10
-    # Setup logging for the model
-    logger.set_level(DEBUG)
-    dir = "logs"
-    if os.path.exists(dir):
-        shutil.rmtree(dir)
-    logger.configure(dir=dir)
-    if torch.cuda.is_available():
-        FloatTensor = torch.cuda.FloatTensor
-        LongTensor = torch.cuda.LongTensor
-    else:
-        FloatTensor = torch.FloatTensor
-        LongTensor = torch.LongTensor
-
-    gamma = 0.99
-    batch_size = 32
-    entropy_coef = 0.01
-    critic_coef = 0.5
-    own()
