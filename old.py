@@ -18,7 +18,7 @@ learning_rate = 7e-4
 gamma = 0.99
 entropy_coef = 0.01
 critic_coef = 0.5
-env_name = 'BreakoutNoFrameskip-v4'
+env_name = 'PongNoFrameskip-v4'
 no_of_workers = 16
 DEBUG = 10
 
@@ -26,7 +26,7 @@ DEBUG = 10
 
 # Setup logging for the model
 logger.set_level(DEBUG)
-dir = "logs"
+dir = "logs2"
 if os.path.exists(dir):
     shutil.rmtree(dir)
 logger.configure(dir=dir)
@@ -248,10 +248,10 @@ class Worker(object):
             # UPDATE BOTH U FACKING BLISTERING IDIOT
             #print(self.state.unsqueeze(0).shape)
 
-            print("ACTION PROB")
-            print(self.state.shape)
-            print("ACTION PROB2")
-            print(self.state.unsqueeze(0).shape)
+            #print("ACTION PROB")
+            #print(self.state.shape)
+            #print("ACTION PROB2")
+            #print(self.state.unsqueeze(0).shape)
             action = model.act(self.state.unsqueeze(0))
             next_state, reward, done, _ = self.env.step(action)
             self.episode_reward += reward
@@ -305,4 +305,5 @@ while frame_idx < max_frames:
         
     value = reflect(memory)
     logger.logkv("frame", frame_idx)
+    logger.logkv("value", value)
     logger.dumpkvs()

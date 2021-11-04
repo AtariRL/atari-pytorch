@@ -240,12 +240,7 @@ class ImageToPyTorch(gym.ObservationWrapper):
     """
     def __init__(self, env):
         super(ImageToPyTorch, self).__init__(env)
-        #old_shape = self.observation_space.shape
-        print("OLD")
-        #print(old_shape)
         old_shape = (84, 84, 4)
-       # print("3 index")
-       # print((old_shape[-1]))
 
         self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(old_shape[-1], old_shape[0], old_shape[1]), dtype=np.uint8)
         #self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(old_shape[0], old_shape[-1], old_shape[1]), dtype=np.uint8)

@@ -201,11 +201,10 @@ def get_batch(batch_size, model, state, env, episode_reward):
             
             if True in done:
                 state = FloatTensor(env.reset())
-                logger.logkv("Episode Reward", episode_reward)
                 episode_reward = 0
             else:
                 state = FloatTensor(next_state)
-                logger.logkv("Episode Reward", episode_reward)
+                episode_reward = np.mean(reward)
                 
         values = compute_true_values(states, rewards, dones, model)
         return states, action_list, values, episode_reward
@@ -230,12 +229,10 @@ def reflect(states, actions, true_values, model, optimizer):
 
 
 def run():
-    
+    n_envs = 20
     # There already exists an environment generator that will make and wrap atari environments correctly.
     # We use 16 parallel processes
-    env = make_atari_env('BreakoutNoFrameskip-v4', n_envs=5, seed=0)
-    # Stack 4 frames
-    #env = VecFrameStack(env, n_stack=4)
+    env = make_atari_env('PongNoFrameskip-v4', n_envs=n_envs, seed=0)
 
     #torch.Size([5, 84, 84, 4]) where 5 is num_env
     # [5, 84, 84, 4] -> [5, 4, 84, 84]
@@ -252,12 +249,15 @@ def run():
 
     episode_reward = 0
     frame_idx = 0
-
-    states, actions, true_values, episode_reward = get_batch(batch_size, model, state, env, episode_reward)
-    value = reflect(states, actions, true_values, model, optimizer)
-    #logger.logkv("frame", frame_idx)
-    logger.logkv("value", value)
-    logger.dumpkvs()
+    while frame_idx < max_frames:
+        states, actions, true_values, episode_reward = get_batch(batch_size, model, state, env, episode_reward)
+        frame_idx += batch_size * n_envs
+    
+        value = reflect(states, actions, true_values, model, optimizer)
+        logger.logkv("frame", frame_idx)
+        logger.logkv("episode_reward", episode_reward)
+        logger.logkv("value", value)
+        logger.dumpkvs()
     
 if __name__ == "__main__":
     DEBUG = 10
