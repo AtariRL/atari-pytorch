@@ -115,14 +115,10 @@ class AtariCNN(nn.Module):
         return v_out,pi_out
 
     def get_critic(self, state):
-        #print("CRITIC")
         value, _ = self.forward(state)
-        #m = nn.Softmax(dim=1)
-        #actor_features = m(value)
         return value
     
     def evaluate_action(self, state, action):
-        #print("EVAL")
         action = torch.FloatTensor(action).cuda()
         value, actor_features = self.forward(state)
         m = nn.Softmax(dim=1)
@@ -134,15 +130,11 @@ class AtariCNN(nn.Module):
         return value, log_probs, entropy
     
     def act(self, state):
-        #print("ACTOR")
         _, actor_features = self.forward(state)
         m = nn.Softmax(dim=1)
         actor_features = m(actor_features)
         dist = torch.distributions.Categorical(actor_features)
-        #print(actor_features)
-        # Provides an action probability for each environ
         chosen_action = dist.sample()
-        #print(type(chosen_action))
         return chosen_action
 
 class Memory(object):
@@ -164,28 +156,28 @@ class Memory(object):
         return states, actions, true_values
 
 def compute_true_values(states, rewards, dones, model):
-
-
-    R = []
+    true_values = []
     rewards = FloatTensor(rewards)
     dones = FloatTensor(dones)
     states = torch.stack(states)
 
-    #print("rewards : {} \ dones : {} \ states : {}".format(rewards.shape, dones.shape, states.shape))
-    
-    next_value = model.get_critic(states[-1].unsqueeze(0))
+    for i in range(len(states)):
+        R = []
         
-    R.append(next_value)
-    for i in reversed(range(0, len(rewards) - 1)):
-        if not dones[i]:
-            next_value = rewards[i] + next_value * gamma
-        else:
-            next_value = rewards[i]
+        next_value = model.get_critic(states[i][-1].unsqueeze(0))
+            
         R.append(next_value)
-        
-    R.reverse()
+        for e in reversed(range(0, len(rewards[i]) - 1)):
+            if not dones[i,e]:
+                next_value = rewards[i,e] + next_value * gamma
+            else:
+                next_value = rewards[i,e]
+            R.append(next_value)
+            
+        R.reverse()
+        true_values.append(FloatTensor(R).unsqueeze(1))
     
-    return FloatTensor(R)
+    return true_values
 
 def get_batch(batch_size, model, state, env, episode_reward):
         states, action_list, rewards, dones, values = [], [], [], [], []
@@ -193,8 +185,6 @@ def get_batch(batch_size, model, state, env, episode_reward):
 
             # Get action probability for each of the envs
             actions = model.act(state)
-            print("ACTIONS")
-            print(actions)
             actions = actions.cpu().numpy()
             actions = list(actions)
             next_state, reward, done, _ = env.step(actions)
@@ -217,25 +207,16 @@ def get_batch(batch_size, model, state, env, episode_reward):
                 state = FloatTensor(next_state)
                 logger.logkv("Episode Reward", episode_reward)
                 
-        #values = compute_true_values(states, rewards, dones, model).unsqueeze(1)
+        values = compute_true_values(states, rewards, dones, model)
         return states, action_list, values, episode_reward
 
 
 def reflect(states, actions, true_values, model, optimizer):
-    print("REFLECT")
-    #print(memory)
-
-    #states, actions, true_values = memory.pop_all()
-    # for i 32 each state, action
-    print("Lengths : {}{}{}".format(len(states), len(actions), len(true_values)))
     for i in range(len(states)):
-        values, log_probs, entropy = model.evaluate_action(states[i], actions[i])
 
+        values, log_probs, entropy = model.evaluate_action(states[i], actions[i])
         advantages =  true_values[i] - values
-        #print("True value {} = Values {}".format(true_values[i] - values))
-        print(advantages)
         critic_loss = advantages.pow(2).mean()
-        print(critic_loss)
 
         actor_loss = -(log_probs * advantages.detach()).mean()
         total_loss = (critic_coef * critic_loss) + actor_loss - (entropy_coef * entropy)
@@ -266,33 +247,15 @@ def run():
     learning_rate = 7e-4
     max_frames = 5000000
 
-    #model = Model(num_act, env).cuda()
     model = AtariCNN(num_act).cuda()
     optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate, eps=1e-5)
 
-    memory = Memory()
     episode_reward = 0
     frame_idx = 0
 
     states, actions, true_values, episode_reward = get_batch(batch_size, model, state, env, episode_reward)
-   # print("TEST BEFORE : {} ".format(states[0].shape))
-    #exit()
-    #print("states : {} \ actions : {} \ true_values : {} \ episode_reward : {}".format(type(states), type(actions), type(true_values),type(episode_reward)))
-    # print("states : {} \ actions : {} \ true_values : {} \ episode_reward : {}".format(type(states), actions, true_values,episode_reward))
-    #print(len(states))
-    #print(len(actions))
-    #print(len(true_values))
-    '''
-    for i, _ in enumerate(states):
-        memory.push(
-            states[i],
-            actions[i],
-            true_values[i]
-        )
-    '''
     value = reflect(states, actions, true_values, model, optimizer)
-
-    logger.logkv("frame", frame_idx)
+    #logger.logkv("frame", frame_idx)
     logger.logkv("value", value)
     logger.dumpkvs()
     
